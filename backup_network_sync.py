@@ -24,6 +24,88 @@ def should_update_file(src_entry, dest_file):
     except FileNotFoundError:
         return True  # If destination file is missing
 
+# def count_files(directory, unit_substring, extension_pattern=None):
+#     """
+#     Count the total number of files in a directory tree, optionally filtered by extensions.
+    
+#     :param directory: The directory to count files in.
+#     :param extensions: List of allowed file extensions (e.g., ['.txt', '.log']). Count all if None or ["*"].
+#     :return: Total file count.
+#     """
+
+#     # Combine the unit substring and extension into a regex pattern
+#     # Match filenames containing the unit substring and ending with the desired extension
+#     regex_string = rf".*{re.escape(unit_substring)}.*{extension_pattern}$"
+#     # print(f"Regex string: {regex_string}")  # Print the regex string for debugging
+
+#     # Compile the regex pattern
+#     file_regex = re.compile(regex_string, re.IGNORECASE)
+
+#     # Initialize a list to collect matching files
+#     target_files = []
+
+#     for root, subdir, files in os.walk(directory):
+#         # Filter files matching the regex pattern
+#         for file in files:
+#             if file_regex.match(file):
+#                 print(f"Found match {os.path.join(root, file)}")
+#                 target_files.append(os.path.join(root, file))
+
+#     # total_files = len(target_files)
+
+#     return target_files
+
+def count_files_regex(directory, extension_pattern=None):
+    """
+    Count the total number of files in a directory tree, optionally filtered by extensions.
+    
+    :param directory: The directory to count files in.
+    :param extensions: List of allowed file extensions (e.g., ['.txt', '.log']). Count all if None or ["*"].
+    :return: Total file count.
+    """
+
+    # Combine the unit substring and extension into a regex pattern
+    # Match filenames containing the unit substring and ending with the desired extension
+    regex_string = rf".*{extension_pattern}$"
+    # print(f"Regex string: {regex_string}")  # Print the regex string for debugging
+
+    # Compile the regex pattern
+    file_regex = re.compile(regex_string, re.IGNORECASE)
+
+    # Initialize a list to collect matching files
+    target_files = []
+
+    for root, _, files in os.walk(directory):
+        # Filter files matching the regex pattern
+        target_files.extend([f for f in files if file_regex.match(f)])
+
+    total_files = len(target_files)
+
+    return total_files, target_files
+
+def normalize_extensions(extensions):
+    """
+    Normalize extensions to ensure they start with a dot.
+    """
+    if not extensions:
+        return []
+    return [ext if ext.startswith(".") else f".{ext}" for ext in extensions]
+
+def extensions_to_regex(extensions):
+    """
+    Convert a list of file extensions (with leading dots) into a regex-compatible pattern.
+    
+    Args:
+        extensions (list): List of file extensions (e.g., ['.txt', '.log', '.csv']).
+    
+    Returns:
+        str: A regex pattern that matches any of the specified extensions.
+    """
+    # Remove the leading dots and escape the extensions for regex compatibility
+    escaped_extensions = [re.escape(ext) for ext in extensions]
+    # Combine extensions into a single regex pattern using alternation (|)
+    return r"(?:" + "|".join(escaped_extensions) + r")"
+
 def count_files(directory, extensions=None):
     """
     Count the total number of files in a directory tree, optionally filtered by extensions.
@@ -68,7 +150,7 @@ def sync_directories_recursive(source, destination, extensions, dry_run, progres
             sync_directories_recursive(source_path, destination_path, extensions, dry_run, progress_bar)
         elif entry.is_file():
             # Handle files
-            
+            # print(entry)
             if extensions and extensions != ["*"] and not entry.name.endswith(tuple(extensions)):
                 # print(f"{entry.name} excluded")
                 continue
@@ -79,6 +161,7 @@ def sync_directories_recursive(source, destination, extensions, dry_run, progres
                     os.makedirs(os.path.dirname(destination_path), exist_ok=True)
                     # print(f"Copying file '{source_path}' to '{destination_path}'")
                     shutil.copy2(source_path, destination_path)
+                    # shutil.copyfile(source_path, destination_path)
             
             # print(f"Processing file [{source_path}]")
             # Update progress bar if provided
