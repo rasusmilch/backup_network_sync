@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from tqdm import tqdm
+from tqdm.auto import tqdm  # better backend selection on Windows/VSCode
 
 try:
     from loguru import logger
@@ -196,10 +196,15 @@ def enumerate_files_live(
     *,
     show_progress: bool,
     log_prefix: str = "Enumerating files",
+    heartbeat_secs: float = 0.5,       # periodic repaint even within one huge dir
+    redraw_every_files: int = 512,     # repaint after N files even if < heartbeat
 ) -> List[Path]:
     """
-    Enumerate files under `root` with live progress and fast Ctrl-C response.
-    Applies extension/exclude filters.
+    Enumerate files with:
+      - extension/exclude filters
+      - frequent liveness updates (time + file-count driven)
+      - responsive Ctrl-C
+      - single output mode (bar OR plaintext OR silent)
     """
     root = safe_resolve(root)
     extset = _make_extset(extensions)
@@ -207,74 +212,98 @@ def enumerate_files_live(
 
     dirs_scanned = 0
     files_seen = 0
-    found = 0
-    last_postfix = 0.0
+    matched = 0
 
-    stack: List[Path] = [root]
+    last_beat = time.monotonic()
+    last_files_seen = 0
+
+    # Decide output mode once
+    use_bar = bool(show_progress)
+    use_plain = (not show_progress) and (not logger._core.handlers)  # we’ll print only if no console logger
+    # We’ll be conservative: prefer bar; otherwise plaintext only if the user wanted "no bar" but not silent.
+    # (If you want plaintext even when console logging is enabled, set use_plain = (not show_progress) and not args.silent)
 
     bar = None
-    if show_progress:
+    if use_bar:
+        # Send tqdm to stderr so it never fights stdout logs
         bar = tqdm(
             total=0,
             unit=" dirs",
             desc=log_prefix,
             dynamic_ncols=True,
             leave=True,
+            mininterval=0.05,
+            smoothing=0.0,
             disable=False,
+            file=sys.stderr,
         )
+    elif use_plain:
+        print(f"[{log_prefix}] starting ...", flush=True)
 
+    def heartbeat():
+        nonlocal last_beat, last_files_seen
+        now = time.monotonic()
+        need_time = (now - last_beat) >= heartbeat_secs
+        need_files = (files_seen - last_files_seen) >= redraw_every_files
+        if not (need_time or need_files):
+            return
+        if bar is not None:
+            bar.set_postfix(dirs=dirs_scanned, files=files_seen, matches=matched)
+            bar.update(0)
+            bar.refresh()
+        elif use_plain:
+            print(f"[{log_prefix}] dirs={dirs_scanned} files={files_seen} matches={matched}", flush=True)
+        if need_time:
+            last_beat = now
+        if need_files:
+            last_files_seen = files_seen
+
+    stack: List[Path] = [root]
     while stack:
         current_dir = stack.pop()
         try:
             for entry in current_dir.iterdir():
-                try:
-                    if entry.is_dir():
-                        stack.append(entry)
-                        continue
-                    if not entry.is_file():
-                        continue
-
+                # Let Ctrl-C abort immediately
+                if entry.is_dir():
+                    stack.append(entry)
+                elif entry.is_file():
                     files_seen += 1
-
+                    # Extension filter
                     if extset and entry.suffix.lower() not in extset:
+                        heartbeat()
                         continue
-
+                    # Exclude filter on relative path
                     if exclude_globs:
                         try:
                             rel = entry.relative_to(root).as_posix()
                         except Exception:
                             rel = entry.name
-                        if any(Path(rel).match(pattern) for pattern in exclude_globs):
+                        if any(Path(rel).match(pat) for pat in exclude_globs):
+                            heartbeat()
                             continue
-
                     results.append(entry)
-                    found += 1
-
-                except PermissionError as e:
-                    logger.warning("Permission denied during enumeration: {p} :: {e}", p=entry, e=e)
-                except OSError as e:
-                    logger.warning("OS error during enumeration: {p} :: {e}", p=entry, e=e)
-
+                    matched += 1
+                heartbeat()
         except PermissionError as e:
-            logger.warning("Permission denied entering directory: {p} :: {e}", p=current_dir, e=e)
+            logger.warning("Permission denied entering dir: {p} :: {e}", p=current_dir, e=e)
         except OSError as e:
-            logger.warning("OS error entering directory: {p} :: {e}", p=current_dir, e=e)
+            logger.warning("OS error entering dir: {p} :: {e}", p=current_dir, e=e)
         finally:
             dirs_scanned += 1
-            if bar:
+            if bar is not None:
                 bar.update(1)
-                now = time.monotonic()
-                if now - last_postfix >= 0.25:
-                    bar.set_postfix(dirs=dirs_scanned, files=files_seen, matches=found)
-                    last_postfix = now
+                bar.set_postfix(dirs=dirs_scanned, files=files_seen, matches=matched)
+                bar.update(0)
+                bar.refresh()
+            elif use_plain:
+                print(f"[{log_prefix}] dirs={dirs_scanned} files={files_seen} matches={matched}", flush=True)
 
-    if bar:
+    if bar is not None:
         bar.close()
 
     logger.info("Enumeration complete: dirs={d}, files_seen={f}, matches={m}",
-                d=dirs_scanned, f=files_seen, m=found)
+                d=dirs_scanned, f=files_seen, m=matched)
     return results
-
 
 def iter_files(
     root: Path,
@@ -820,8 +849,9 @@ def main() -> None:
         hash_chunk_bytes=max(64 * 1024, args.hash_chunk),  # minimum 64 KiB
     )
 
-    # TQDM visibility
-    show_progress = (not args.silent) and is_tty() and (not args.no_progress_bar)
+    # show bars whenever allowed (even if not a true TTY)
+    show_progress = (not args.silent) and (not args.no_progress_bar)
+
 
     # Run all plans
     for plan in plans:
