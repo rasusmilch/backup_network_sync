@@ -180,9 +180,9 @@ def sync_directories(source, destination, backup_base_dir, extensions, backup, d
 
     # Check if destination directory is accessible
     if not os.path.exists(destination):
-        print(f"Destination directory '{destination}' does not exist. Skipping.")
-        return
-
+        print(f"Destination directory '{destination}' does not exist. Creating...")
+        os.makedirs(destination, exist_ok=True)
+        
     # Count files and initialize progress bar
     total_files = count_files(source, extensions)
     
