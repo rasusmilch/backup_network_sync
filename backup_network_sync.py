@@ -1,266 +1,447 @@
-import configparser
-import os
-import shutil
-import datetime
-import argparse
-from tqdm import tqdm
-import sys 
+#!/usr/bin/env python3
+"""
+Directory Sync Script (pathlib edition)
 
-def should_update_file(src_entry, dest_file):
+- Uses pathlib for all path handling
+- Atomic copy to avoid half-written targets
+- Tolerant mtime comparisons to handle coarse filesystem timestamps
+- Optional backup copy into a date-stamped directory tree
+- Optional exclude glob patterns per section (e.g., "*.tmp,~$*")
+- Robust progress reporting with tqdm
+- Defensive checks (source/destination existence, subpath containment, etc.)
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import datetime as dt
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+from tqdm import tqdm
+
+
+# ------------------------------- Data Types --------------------------------- #
+
+@dataclass(frozen=True)
+class SyncPlan:
+    """Simple value object that describes a single sync job."""
+    section_name: str
+    source: Path
+    destination: Path
+    extensions: Optional[Sequence[str]]
+    backup_enabled: bool
+    exclude_globs: Sequence[str]
+
+
+# ------------------------------ Small Utilities ----------------------------- #
+
+def is_tty() -> bool:
+    """Return True if stdout is a TTY (i.e., interactive terminal)."""
+    return sys.stdout.isatty()
+
+
+def normalize_extensions(exts: Optional[Sequence[str]]) -> Optional[List[str]]:
     """
-    Determines if the source file should be copied to the destination
-    based on modification times and file sizes.
+    @brief Normalize extensions: ensure leading dot, lower-case, drop empties.
+    @param exts Optional sequence of extensions; "*" or None means "all".
+    @return Normalized list or None if no filtering should be applied.
+    """
+    if not exts:
+        return None
+    cleaned: List[str] = []
+    for e in exts:
+        e = (e or "").strip()
+        if not e:
+            continue
+        if e == "*":
+            return None  # "*" means no filtering
+        if not e.startswith("."):
+            e = "." + e
+        cleaned.append(e.lower())
+    return cleaned or None
+
+
+def parse_csv(s: str) -> List[str]:
+    """
+    @brief Parse a simple comma-separated string into a list of trimmed items.
+    @param s The input string (possibly empty).
+    @return List of items (may be empty).
+    """
+    if not s:
+        return []
+    return [part.strip() for part in s.split(",") if part.strip()]
+
+
+def safe_resolve(p: Path) -> Path:
+    """
+    @brief Resolve a path without failing on non-existent parents.
+    @param p The path to resolve.
+    @return Resolved absolute path (best effort).
     """
     try:
-        if not os.path.exists(dest_file):
-            return True  # Destination file doesn't exist, so it needs to be copied
+        return p.expanduser().resolve(strict=False)
+    except Exception:
+        # Fallback: expand user and make absolute
+        return p.expanduser().absolute()
 
-        # Get metadata for source and destination
-        src_stat = src_entry.stat()  # Efficiently retrieves metadata during directory scan
-        dest_stat = os.stat(dest_file)
 
-        # Compare modification times and file sizes
-        return src_stat.st_mtime > dest_stat.st_mtime or src_stat.st_size != dest_stat.st_size
+def path_is_within(child: Path, parent: Path) -> bool:
+    """
+    @brief True if `child` is located inside `parent` (after resolving).
+    """
+    child_r = safe_resolve(child)
+    parent_r = safe_resolve(parent)
+    try:
+        child_r.relative_to(parent_r)
+        return True
+    except ValueError:
+        return False
+
+
+# ------------------------------ Core Functions ------------------------------ #
+
+def iter_files(
+    root: Path,
+    extensions: Optional[Sequence[str]],
+    exclude_globs: Sequence[str],
+) -> Iterable[Path]:
+    """
+    @brief Yield all files in `root` respecting extension and exclude filters.
+    @param root The root directory to walk.
+    @param extensions Optional set/list of extensions (e.g., [".txt", ".log"]); None = all.
+    @param exclude_globs Sequence of glob patterns to exclude (applied to relative path).
+    @yield Path objects for files under root.
+    """
+    root = safe_resolve(root)
+    extset = set(e.lower() for e in (extensions or []))
+
+    for p in root.rglob("*"):
+        # Only files
+        if not p.is_file():
+            continue
+
+        # Extension filter (case-insensitive)
+        if extset and p.suffix.lower() not in extset:
+            continue
+
+        # Exclusion filter (match against relative path string)
+        if exclude_globs:
+            rel = p.relative_to(root).as_posix()
+            excluded = any(Path(rel).match(pattern) for pattern in exclude_globs)
+            if excluded:
+                continue
+
+        yield p
+
+
+def should_update_file(
+    src: Path,
+    dst: Path,
+    *,
+    mtime_slack_seconds: float = 1.0,
+    compare_size: bool = True,
+) -> bool:
+    """
+    @brief Decide whether a file should be updated based on metadata.
+    @param src Source file path.
+    @param dst Destination file path.
+    @param mtime_slack_seconds Allowable timestamp slack to handle coarse fs mtimes.
+    @param compare_size If True, also compare sizes.
+    @return True if we should copy `src` to `dst`.
+    """
+    try:
+        if not dst.exists():
+            return True
+
+        s_stat = src.stat()
+        d_stat = dst.stat()
+
+        # Compare mtime with tolerance
+        mtime_diff = s_stat.st_mtime - d_stat.st_mtime
+        if mtime_diff > mtime_slack_seconds:
+            return True
+
+        # Optionally compare size
+        if compare_size and s_stat.st_size != d_stat.st_size:
+            return True
+
+        return False
     except FileNotFoundError:
-        return True  # If destination file is missing
+        # Destination vanished mid-check; copy it.
+        return True
+    except PermissionError:
+        # Safer to attempt update (may fail later, but we tried).
+        return True
 
-# def count_files(directory, unit_substring, extension_pattern=None):
-#     """
-#     Count the total number of files in a directory tree, optionally filtered by extensions.
-    
-#     :param directory: The directory to count files in.
-#     :param extensions: List of allowed file extensions (e.g., ['.txt', '.log']). Count all if None or ["*"].
-#     :return: Total file count.
-#     """
 
-#     # Combine the unit substring and extension into a regex pattern
-#     # Match filenames containing the unit substring and ending with the desired extension
-#     regex_string = rf".*{re.escape(unit_substring)}.*{extension_pattern}$"
-#     # print(f"Regex string: {regex_string}")  # Print the regex string for debugging
-
-#     # Compile the regex pattern
-#     file_regex = re.compile(regex_string, re.IGNORECASE)
-
-#     # Initialize a list to collect matching files
-#     target_files = []
-
-#     for root, subdir, files in os.walk(directory):
-#         # Filter files matching the regex pattern
-#         for file in files:
-#             if file_regex.match(file):
-#                 print(f"Found match {os.path.join(root, file)}")
-#                 target_files.append(os.path.join(root, file))
-
-#     # total_files = len(target_files)
-
-#     return target_files
-
-def count_files_regex(directory, extension_pattern=None):
+def copy_file_atomic(src: Path, dst: Path, *, dry_run: bool) -> None:
     """
-    Count the total number of files in a directory tree, optionally filtered by extensions.
-    
-    :param directory: The directory to count files in.
-    :param extensions: List of allowed file extensions (e.g., ['.txt', '.log']). Count all if None or ["*"].
-    :return: Total file count.
+    @brief Copy `src` to `dst` atomically: copy to temp file then replace.
+    @param src Source file path.
+    @param dst Destination file path (parent is created as needed).
+    @param dry_run When True, do not modify the filesystem.
     """
-
-    # Combine the unit substring and extension into a regex pattern
-    # Match filenames containing the unit substring and ending with the desired extension
-    regex_string = rf".*{extension_pattern}$"
-    # print(f"Regex string: {regex_string}")  # Print the regex string for debugging
-
-    # Compile the regex pattern
-    file_regex = re.compile(regex_string, re.IGNORECASE)
-
-    # Initialize a list to collect matching files
-    target_files = []
-
-    for root, _, files in os.walk(directory):
-        # Filter files matching the regex pattern
-        target_files.extend([f for f in files if file_regex.match(f)])
-
-    total_files = len(target_files)
-
-    return total_files, target_files
-
-def normalize_extensions(extensions):
-    """
-    Normalize extensions to ensure they start with a dot.
-    """
-    if not extensions:
-        return []
-    return [ext if ext.startswith(".") else f".{ext}" for ext in extensions]
-
-def extensions_to_regex(extensions):
-    """
-    Convert a list of file extensions (with leading dots) into a regex-compatible pattern.
-    
-    Args:
-        extensions (list): List of file extensions (e.g., ['.txt', '.log', '.csv']).
-    
-    Returns:
-        str: A regex pattern that matches any of the specified extensions.
-    """
-    # Remove the leading dots and escape the extensions for regex compatibility
-    escaped_extensions = [re.escape(ext) for ext in extensions]
-    # Combine extensions into a single regex pattern using alternation (|)
-    return r"(?:" + "|".join(escaped_extensions) + r")"
-
-def count_files(directory, extensions=None):
-    """
-    Count the total number of files in a directory tree, optionally filtered by extensions.
-    
-    :param directory: The directory to count files in.
-    :param extensions: List of allowed file extensions (e.g., ['.txt', '.log']). Count all if None or ["*"].
-    :return: Total file count.
-    """
-    total_files = 0
-    for entry in os.scandir(directory):
-        if entry.is_dir():
-            # Recursively count files in subdirectories
-            total_files += count_files(entry.path, extensions)
-        elif entry.is_file():
-            # Check file extensions, if provided
-            if extensions and extensions != ["*"] and not entry.name.endswith(tuple(extensions)):
-                continue
-            total_files += 1
-    return total_files
-
-def sync_directories_recursive(source, destination, extensions, dry_run, progress_bar=None):
-    """
-    Recursively syncs directories using os.scandir.
-    """
-
-    for entry in os.scandir(source):
-        source_path = entry.path
-        relative_path = os.path.relpath(source_path, source)
-        destination_path = os.path.join(destination, relative_path)
-
-        if entry.is_dir():
-            # Handle subdirectories
-            # print(f"Processing directory: {source_path}...")
-
-            if not os.path.exists(destination_path):
-                if dry_run:
-                    print(f"[DRY-RUN] Would create directory '{destination_path}'")
-                else:
-                    os.makedirs(destination_path, exist_ok=True)
-                    # print(f"Created directory '{destination_path}'")
-            # Recursive call for subdirectory
-            sync_directories_recursive(source_path, destination_path, extensions, dry_run, progress_bar)
-        elif entry.is_file():
-            # Handle files
-            # print(entry)
-            if extensions and extensions != ["*"] and not entry.name.endswith(tuple(extensions)):
-                # print(f"{entry.name} excluded")
-                continue
-            if should_update_file(entry, destination_path):
-                if dry_run:
-                    print(f"[DRY-RUN] Would copy file '{source_path}' to '{destination_path}'")
-                else:
-                    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-                    # print(f"Copying file '{source_path}' to '{destination_path}'")
-                    shutil.copy2(source_path, destination_path)
-                    # shutil.copyfile(source_path, destination_path)
-            
-            # print(f"Processing file [{source_path}]")
-            # Update progress bar if provided
-            if progress_bar:
-                # print(f"Updating progress bar")
-                progress_bar.update(1)
-
-def sync_directories(source, destination, backup_base_dir, extensions, backup, dry_run):
-    # Normalize extensions
-    extensions = normalize_extensions(extensions)
-
-    # Check if source directory exists
-    if not os.path.exists(source):
-        print(f"Source directory '{source}' does not exist. Skipping.")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        print(f"[DRY-RUN] Would copy '{src}' -> '{dst}'")
         return
 
-    # Check if destination directory is accessible
-    if not os.path.exists(destination):
-        print(f"Destination directory '{destination}' does not exist. Creating...")
-        os.makedirs(destination, exist_ok=True)
-        
-    # Count files and initialize progress bar
-    total_files = count_files(source, extensions)
-    
-    # Perform backup if the backup flag is set to true
-    if backup:
-        date_dir = datetime.datetime.now().strftime('%Y-%m-%d')
-        relative_path = os.path.relpath(source, "C:\\")  # Exclude drive letter
-        backup_dir = os.path.join(backup_base_dir, date_dir, relative_path)
+    # Temp file in same directory for atomic replace
+    tmp = dst.with_suffix(dst.suffix + ".copy_tmp")
+    try:
+        shutil.copy2(src, tmp)
+        # Path.replace is atomic on POSIX and Windows
+        tmp.replace(dst)
+    finally:
+        # Best-effort cleanup if something went wrong before replace
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
-        # Create backup directory
+
+def sync_once(
+    source: Path,
+    destination: Path,
+    extensions: Optional[Sequence[str]],
+    exclude_globs: Sequence[str],
+    *,
+    dry_run: bool,
+    desc: str,
+) -> None:
+    """
+    @brief Sync (copy/update) files from source into destination one pass.
+    @param source Source directory.
+    @param destination Destination directory (created as needed).
+    @param extensions Optional list of normalized extensions; None = all.
+    @param exclude_globs Glob patterns to exclude.
+    @param dry_run If True, print actions without making changes.
+    @param desc Label for the tqdm progress bar.
+    """
+    files = list(iter_files(source, extensions, exclude_globs))
+    total = len(files)
+
+    destination.mkdir(parents=True, exist_ok=True)
+
+    with tqdm(
+        total=total, desc=desc, dynamic_ncols=True, disable=not is_tty()
+    ) as bar:
+        for src_file in files:
+            rel = src_file.relative_to(source)
+            dst_file = destination / rel
+
+            try:
+                if should_update_file(src_file, dst_file):
+                    copy_file_atomic(src_file, dst_file, dry_run=dry_run)
+            except PermissionError as e:
+                print(f"[WARN] Permission error: {src_file} -> {dst_file}: {e}")
+            except OSError as e:
+                print(f"[WARN] OS error: {src_file} -> {dst_file}: {e}")
+            finally:
+                bar.update(1)
+
+
+def compute_backup_dir(backup_base: Path, source: Path, when: Optional[dt.datetime] = None) -> Path:
+    """
+    @brief Compute a dated backup directory path for a given source path.
+
+    The layout under `backup_base` is:
+      YYYY-MM-DD/<drive-or-root>/<path-relative-to-root>
+
+    Examples:
+      Windows:  base/2025-09-12/C/Users/Alice/Documents/Project
+      POSIX:    base/2025-09-12/root/home/alice/Documents/Project
+
+    @param backup_base Base directory where backups are stored.
+    @param source Source directory being backed up.
+    @param when Optional timestamp for the date folder; defaults to now.
+    @return Destination Path for the backup tree root for this source.
+    """
+    when = when or dt.datetime.now()
+    date_dir = when.strftime("%Y-%m-%d")
+
+    src_resolved = safe_resolve(source)
+    anchor = Path(src_resolved.anchor).as_posix().strip("/\\")
+    if not anchor:
+        # POSIX root "/" yields empty after strip; name it "root"
+        anchor = "root"
+
+    # Strip the anchor from the source to get a path relative to filesystem root
+    try:
+        relative_to_root = src_resolved.relative_to(src_resolved.anchor)
+    except Exception:
+        # Should not happen, but fall back to name-only
+        relative_to_root = Path(src_resolved.name)
+
+    return safe_resolve(backup_base) / date_dir / anchor / relative_to_root
+
+
+def validate_source_and_destination(source: Path, destination: Path) -> Optional[str]:
+    """
+    @brief Validate source/destination pair. Returns an error string or None if OK.
+    """
+    if not source.exists():
+        return f"Source directory '{source}' does not exist."
+
+    if not source.is_dir():
+        return f"Source path '{source}' is not a directory."
+
+    # Destination may not exist yet; we only check for obvious foot-guns
+    if path_is_within(destination, source):
+        return (
+            "Refusing to sync into a subdirectory of the source.\n"
+            f"  source:      {safe_resolve(source)}\n"
+            f"  destination: {safe_resolve(destination)}"
+        )
+
+    return None
+
+
+def run_sync_job(
+    plan: SyncPlan,
+    backup_base_dir: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    """
+    @brief Execute a single sync job (optionally with backup pass first).
+    @param plan The SyncPlan describing this job.
+    @param backup_base_dir Base directory for backups.
+    @param dry_run If True, only print intended actions.
+    """
+    print(f"\nProcessing section: {plan.section_name}")
+
+    # Validate
+    err = validate_source_and_destination(plan.source, plan.destination)
+    if err:
+        print(f"[ERROR] {err} Skipping.")
+        return
+
+    # Optional backup pass
+    if plan.backup_enabled:
+        backup_dir = compute_backup_dir(backup_base_dir, plan.source)
         if dry_run:
             print(f"[DRY-RUN] Would create backup directory '{backup_dir}'")
         else:
-            print(f"Creating backup directory '{backup_dir}'")
-            os.makedirs(backup_dir, exist_ok=True)
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        sync_once(
+            plan.source, backup_dir, plan.extensions, plan.exclude_globs,
+            dry_run=dry_run, desc="Backing up files"
+        )
 
-        # Move files from source to backup directory
-        with tqdm(total=total_files, desc="Backing up files", dynamic_ncols=True, disable=not sys.stdout.isatty()) as progress_bar:
-            sync_directories_recursive(source, backup_dir, extensions, dry_run, progress_bar)
-
-
-
-    # Sync files from source to destination directory
-    with tqdm(total=total_files, desc="Syncing files", dynamic_ncols=True, disable=not sys.stdout.isatty()) as progress_bar:
-        sync_directories_recursive(source, destination, extensions, dry_run, progress_bar)
+    # Main sync pass
+    sync_once(
+        plan.source, plan.destination, plan.extensions, plan.exclude_globs,
+        dry_run=dry_run, desc="Syncing files"
+    )
 
     if dry_run:
-        print(f"[DRY RUN] Synced '{source}' with '{destination}'")
+        print(f"[DRY-RUN] Completed planned sync: '{plan.source}' -> '{plan.destination}'")
     else:
-        print(f"Synced '{source}' with '{destination}'")
+        print(f"Synced '{plan.source}' -> '{plan.destination}'")
 
-def normalize_extensions(extensions):
+
+# ---------------------------------- CLI / INI -------------------------------- #
+
+def load_plans_from_ini(ini_path: Path) -> Tuple[Path, List[SyncPlan]]:
     """
-    Normalize extensions to ensure they start with a dot.
+    @brief Load sync plans from an INI file.
+    @param ini_path Path to the INI configuration file.
+    @return (backup_base_dir, list_of_plans)
+    @throws SystemExit on unrecoverable config errors.
     """
-    if not extensions:
-        return []
-    return [ext if ext.startswith(".") else f".{ext}" for ext in extensions]
+    cfg = configparser.ConfigParser()
+    read_ok = cfg.read(ini_path)
+    if not read_ok:
+        raise SystemExit(f"[ERROR] Failed to read config file: {ini_path}")
 
-def main():
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Directory Sync Script")
-    parser.add_argument("-c", "--config", required=True, help="Path to config.ini file (default: ./config.ini)")
-    parser.add_argument("-d", "--dry-run", action="store_true", help="Simulate the actions without making changes")
-    args = parser.parse_args()
+    # Settings section (required: backup_dir)
+    if "Settings" not in cfg:
+        raise SystemExit("[ERROR] Missing [Settings] section in config.")
+    backup_dir_str = cfg.get("Settings", "backup_dir", fallback="").strip()
+    if not backup_dir_str:
+        raise SystemExit("[ERROR] 'backup_dir' not specified in [Settings].")
+    backup_base = safe_resolve(Path(backup_dir_str))
 
-    # Load configuration file, defaulting to ./config.ini if not specified
-    config_path = args.config
-    
-    if not os.path.exists(config_path):
-        print(f"Config file '{config_path}' not found. Exiting.")
-        return
-
-    # Load configuration
-    config = configparser.ConfigParser()
-    config.read(config_path)
-
-    # Get backup directory from [Settings] section
-    backup_base_dir = config.get("Settings", "backup_dir", fallback=None)
-    if not backup_base_dir:
-        print("Backup directory not specified in [Settings]. Exiting.")
-        return
-
-    # Process each directory pair in config
-    for section in config.sections():
+    plans: List[SyncPlan] = []
+    for section in cfg.sections():
         if section == "Settings":
             continue
 
-        source = config[section].get("source")
-        destination = config[section].get("destination")
-        extensions = config[section].get("extensions", "").split(",")  # Get extensions as a list
-        backup = config[section].getboolean("backup", fallback=True)  # Default to true if not specified
+        src_str = cfg[section].get("source", "").strip()
+        dst_str = cfg[section].get("destination", "").strip()
+        if not src_str or not dst_str:
+            print(f"[WARN] Skipping '{section}': missing source or destination.")
+            continue
 
-        if source and destination:
-            print(f"\nProcessing section: {section}")
-            sync_directories(source, destination, backup_base_dir, extensions, backup, args.dry_run)
-        else:
-            print(f"Skipping section '{section}': missing source or destination path")
+        exts = parse_csv(cfg[section].get("extensions", ""))
+        exts = normalize_extensions(exts)
+
+        backup = cfg[section].getboolean("backup", fallback=True)
+
+        exclude_globs = parse_csv(cfg[section].get("exclude_globs", ""))
+
+        plans.append(
+            SyncPlan(
+                section_name=section,
+                source=safe_resolve(Path(src_str)),
+                destination=safe_resolve(Path(dst_str)),
+                extensions=exts,
+                backup_enabled=backup,
+                exclude_globs=exclude_globs,
+            )
+        )
+
+    if not plans:
+        print("[WARN] No sync sections found in config.")
+    return backup_base, plans
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    @brief Build the CLI argument parser.
+    """
+    p = argparse.ArgumentParser(description="Directory Sync Script (pathlib edition)")
+    p.add_argument(
+        "-c", "--config",
+        default="config.ini",
+        help="Path to config.ini (default: ./config.ini)"
+    )
+    p.add_argument(
+        "-d", "--dry-run",
+        action="store_true",
+        help="Simulate actions without making changes"
+    )
+    return p
+
+
+def main() -> None:
+    """
+    @brief Entry point. Parses CLI, loads plans, and executes them.
+    """
+    args = build_arg_parser().parse_args()
+
+    ini_path = safe_resolve(Path(args.config))
+    if not ini_path.exists():
+        raise SystemExit(f"[ERROR] Config file not found: {ini_path}")
+
+    backup_base, plans = load_plans_from_ini(ini_path)
+
+    # Ensure the backup base exists (unless dry-run; then just announce)
+    if args.dry_run:
+        print(f"[DRY-RUN] Would ensure backup base directory: '{backup_base}'")
+    else:
+        backup_base.mkdir(parents=True, exist_ok=True)
+
+    for plan in plans:
+        run_sync_job(plan, backup_base, dry_run=args.dry_run)
+
 
 if __name__ == "__main__":
     main()
